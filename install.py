@@ -38,6 +38,14 @@ def replace_once(text, old, new):
 
 def patch_extension(text):
     """Preserve the bundle and unrelated customizations; guard all replacement anchors."""
+    if "\r\n" in text:
+        if text.count("\r\n") != text.count("\n"):
+            raise ValueError("Mixed extension line endings; inspect before updating")
+        return _patch_lf(text.replace("\r\n", "\n")).replace("\n", "\r\n")
+    return _patch_lf(text)
+
+
+def _patch_lf(text):
     if BEGIN in text:
         if text.count(INTEGRATION) != 1 or text.count(DISPATCH) != 1:
             raise ValueError("Existing bridge differs; inspect before updating")

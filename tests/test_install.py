@@ -65,6 +65,17 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(installer.patch_extension(patched), patched)
         self.assertEqual(patched.replace(installer.INTEGRATION, "").replace(installer.DISPATCH, ""), CLEAN)
 
+    def test_crlf_patch_preserves_all_original_line_endings(self):
+        original = CLEAN.replace("\n", "\r\n")
+        patched = installer.patch_extension(original)
+        self.assertEqual(installer.patch_extension(patched), patched)
+        self.assertEqual(patched.count("\n"), patched.count("\r\n"))
+        restored = patched.replace(installer.INTEGRATION.replace("\n", "\r\n"), "")
+        restored = restored.replace(installer.DISPATCH.replace("\n", "\r\n"), "")
+        self.assertEqual(restored, original)
+        with self.assertRaises(ValueError):
+            installer.patch_extension(CLEAN.replace("\n", "\r\n", 1))
+
     def test_legacy_patch_preserves_other_customizations(self):
         legacy = CLEAN.replace("function sendOsNotification(",
                                "// Local Codex notification bridge: preserve terminal routing and use the same\n"
