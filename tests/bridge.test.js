@@ -138,3 +138,46 @@ test("debug is off by default, and opt-in debug excludes message, session and te
   assert.equal(text.includes("private-test-value"), false);
   assert.deepEqual(Object.keys(JSON.parse(text)).sort(), ["event", "time"]);
 });
+
+for (const event of ["error", "close", "stdin"]) {
+  test(`privacy mode hides both title and body on asynchronous ${event} fallback`, t => {
+    const {bridge, child, calls} = setup(t, {process: {platform: "win32", env: {CODEX_NOTIFY_PREVIEW: "0"}}});
+    bridge.sendQuestion("test terminal", "PRIVATE_TITLE", "Question: PRIVATE_BODY");
+    if (event === "error") child.emit("error", Error("synthetic failure"));
+    if (event === "close") child.emit("close", 1);
+    if (event === "stdin") child.stdin.emit("error", Error("synthetic failure"));
+    assert.equal(calls.notify.length, 1);
+    assert.equal(calls.notify[0].tid, "test terminal");
+    assert.equal(JSON.stringify(calls.notify).includes("PRIVATE_"), false);
+  });
+}
+
+test("preview-enabled notifications retain their original title and message", t => {
+  const {bridge} = setup(t);
+  assert.deepEqual(bridge.safeNotification("Original title", "Original message"),
+    {title: "Original title", message: "Original message"});
+});
+
+test("repeated older completion cannot claim a newer same-text pending completion", t => {
+  const {root, bridge} = setup(t);
+  pending(root);
+  assert.equal(bridge.routeCompletion("test terminal", "测试完成。"), true);
+  const newer = pending(root, {token: "22222222-2222-4222-8222-222222222222", session_id: "another-session"});
+  assert.equal(bridge.routeCompletion("test terminal", "测试完成。"), true);
+  assert.equal(fs.existsSync(newer), false);
+});
+
+test("exclusive route creation by another terminal does not report a successful claim", t => {
+  const {root, options, dependencies} = setup(t);
+  const route = pending(root);
+  const racingFs = {...fs, writeFileSync: (filename, data, opts) => {
+    if (filename === route && opts.flag === "wx") {
+      fs.writeFileSync(route, JSON.stringify({session_id: "synthetic-session", terminal_id: "another-terminal"}));
+      throw Object.assign(Error("synthetic race"), {code: "EEXIST"});
+    }
+    return fs.writeFileSync(filename, data, opts);
+  }};
+  const bridge = createBridge(options, {...dependencies, fs: racingFs});
+  assert.equal(bridge.routeCompletion("test terminal", "测试完成。"), false);
+  assert.equal(JSON.parse(fs.readFileSync(route)).terminal_id, "another-terminal");
+});

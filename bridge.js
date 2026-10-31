@@ -24,12 +24,17 @@ function completionRoutingLog(event) {
       JSON.stringify({time: new Date().toISOString(), event}) + "\n");
   } catch {}
 }
+function safeNotification(title, message) {
+  if (process.env.CODEX_NOTIFY_PREVIEW !== "0") return {title, message};
+  return {title: "Terminal", message: "终端有新通知，请返回查看。"};
+}
 function routeCodexCompletion(tid, message) {
   if (process.platform !== "win32") return false;
   const directory = path.join(stateDirectory, "completion");
   try {
     if (!fs.existsSync(directory)) return false;
     const pending = [];
+    let matchingRecords = 0;
     let alreadyRouted = false;
     for (const name of fs.readdirSync(directory)) {
       if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
@@ -39,6 +44,7 @@ function routeCodexCompletion(tid, message) {
       const age = Date.now() - record.created_ms;
       if (age < 0 || age > 40000 || name !== record.token + ".json" || !record.session_id) continue;
       if (codexCompletionPreview(record.response) !== message) continue;
+      matchingRecords++;
       const routePath = path.join(directory, record.token + ".route.json");
       if (fs.existsSync(routePath)) {
         try { alreadyRouted ||= JSON.parse(fs.readFileSync(routePath, "utf8")).terminal_id === tid; } catch {}
@@ -47,7 +53,9 @@ function routeCodexCompletion(tid, message) {
       }
     }
     if (pending.length === 0) return alreadyRouted;
-    if (pending.length !== 1) {
+    // Routed records also matter: a repeated older preview must never claim
+    // a newer same-text completion belonging to another terminal.
+    if (matchingRecords !== 1) {
       completionRoutingLog("completion_ambiguous", {terminal_id: tid, candidates: pending.length});
       return true;
     }
@@ -62,7 +70,11 @@ function routeCodexCompletion(tid, message) {
     };
     // Exclusive creation prevents another window from overwriting this route.
     try { fs.writeFileSync(routePath, JSON.stringify(route), {encoding: "utf8", flag: "wx"}); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
+    catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const winner = JSON.parse(fs.readFileSync(routePath, "utf8"));
+      return winner.session_id === record.session_id && winner.terminal_id === tid;
+    }
     completionRoutingLog("completion_routed", {session_id: record.session_id, terminal_id: tid});
     return true;
   } catch (error) {
@@ -85,7 +97,7 @@ function sendCodexQuestionPopup(tid, title, message) {
   });
   const fallback = (error) => {
     console.error("Codex question popup failed", error);
-    options.getNotifier().notify({title: title || "Codex", message, wait: true, tid});
+    options.getNotifier().notify({...safeNotification(title || "Codex", message), wait: true, tid});
   };
   try {
     const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
@@ -111,6 +123,7 @@ function sendCodexQuestionPopup(tid, title, message) {
     return false;
   }
 }
-  return {routeCompletion: routeCodexCompletion, sendQuestion: sendCodexQuestionPopup, log: completionRoutingLog};
+  return {routeCompletion: routeCodexCompletion, sendQuestion: sendCodexQuestionPopup,
+    safeNotification, log: completionRoutingLog};
 }
 module.exports = {createBridge};

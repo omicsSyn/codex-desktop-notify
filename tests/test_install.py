@@ -4,6 +4,8 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import shutil
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +21,9 @@ function sendOsNotification(tid, title, message) {
   const preferOs = getSetting("preferOsNotifications", true);
   if (!preferOs) return;
   notifier.notify({title, message, tid});
+}
+function sendVsCodeNotification(tid, title, message) {
+  vscode.window.showInformationMessage(title + ": " + message);
 }
 '''
 
@@ -63,7 +68,8 @@ class InstallationTests(unittest.TestCase):
     def test_clean_patch_is_minimal_and_idempotent(self):
         patched = installer.patch_extension(CLEAN)
         self.assertEqual(installer.patch_extension(patched), patched)
-        self.assertEqual(patched.replace(installer.INTEGRATION, "").replace(installer.DISPATCH, ""), CLEAN)
+        restored = patched.replace(installer.INTEGRATION, "").replace(installer.DISPATCH, "")
+        self.assertEqual(restored.replace(installer.VSCODE_HEADER + installer.PRIVACY, installer.VSCODE_HEADER), CLEAN)
 
     def test_crlf_patch_preserves_all_original_line_endings(self):
         original = CLEAN.replace("\n", "\r\n")
@@ -72,9 +78,46 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(patched.count("\n"), patched.count("\r\n"))
         restored = patched.replace(installer.INTEGRATION.replace("\n", "\r\n"), "")
         restored = restored.replace(installer.DISPATCH.replace("\n", "\r\n"), "")
+        restored = restored.replace((installer.VSCODE_HEADER + installer.PRIVACY).replace("\n", "\r\n"),
+                                    installer.VSCODE_HEADER.replace("\n", "\r\n"))
         self.assertEqual(restored, original)
         with self.assertRaises(ValueError):
             installer.patch_extension(CLEAN.replace("\n", "\r\n", 1))
+
+    def test_prior_public_patch_upgrades_both_privacy_exits(self):
+        previous = CLEAN.replace("function sendOsNotification(", installer.INTEGRATION + "function sendOsNotification(")
+        previous = previous.replace("  if (!preferOs) return;\n", "  if (!preferOs) return;\n" + installer.OLD_DISPATCH)
+        patched = installer.patch_extension(previous)
+        self.assertEqual(patched.count(installer.PRIVACY), 2)
+        self.assertEqual(installer.patch_extension(patched), patched)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the integration test")
+    def test_privacy_applies_to_actual_patched_os_and_vscode_entrypoints(self):
+        script = r'''
+const vm = require('node:vm'), assert = require('node:assert/strict');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const {createBridge} = require(input.bridge);
+for (const preferOs of [true, false]) {
+  const os = [], ui = [];
+  const context = {
+    vscode: {env: {uriScheme: 'vscode'}, window: {showInformationMessage: message => ui.push(message)}},
+    extensionCtx: {extension: {id: 'wenbopan.vscode-terminal-osc-notifier'}},
+    notifier: {notify: options => os.push(options)}, getSetting: () => preferOs,
+    require: () => ({createBridge: options => createBridge(options, {
+      fs: {existsSync: () => false}, process: {platform: 'win32', env: {CODEX_NOTIFY_PREVIEW: '0'}}
+    })})
+  };
+  vm.createContext(context); vm.runInContext(input.code, context);
+  context.sendOsNotification('example', 'PRIVATE_TITLE', 'Question: PRIVATE_BODY');
+  context.sendVsCodeNotification('example', 'PRIVATE_TITLE', 'Question: PRIVATE_BODY');
+  assert.equal(os.length, preferOs ? 1 : 0);
+  assert.equal(ui.length, 1);
+  assert.equal(JSON.stringify({os, ui}).includes('PRIVATE_'), false);
+  if (preferOs) assert.equal(os[0].tid, 'example');
+}
+'''
+        subprocess.run([shutil.which("node"), "-e", script], check=True, timeout=15, text=True,
+                       input=json.dumps({"code": installer.patch_extension(CLEAN), "bridge": str(ROOT / "bridge.js")}))
 
     def test_legacy_patch_preserves_other_customizations(self):
         legacy = CLEAN.replace("function sendOsNotification(",
@@ -131,6 +174,81 @@ class InstallationTests(unittest.TestCase):
                 installer.restore(backup)
             self.assertEqual(one.read_bytes(), b"new one")
             self.assertEqual(two.read_bytes(), b"later user edit")
+
+    def test_restore_io_failure_rolls_back_and_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            one, two = root / "one", root / "two"
+            one.write_bytes(b"old one")
+            two.write_bytes(b"old two")
+            backup = installer.write_with_backup({one: b"new one", two: b"new two"}, root / "backups")
+            actual = installer.os.replace
+
+            def fail_second(staged, target):
+                if Path(target) == two:
+                    raise OSError("synthetic second-file I/O failure")
+                return actual(staged, target)
+
+            with patch.object(installer.os, "replace", fail_second), self.assertRaises(OSError):
+                installer.restore(backup)
+            self.assertEqual(one.read_bytes(), b"new one")
+            self.assertEqual(two.read_bytes(), b"new two")
+            self.assertEqual(list(root.glob(".codex-notify-*")), [])
+            installer.restore(backup)
+            self.assertEqual(one.read_bytes(), b"old one")
+            self.assertEqual(two.read_bytes(), b"old two")
+
+    def test_restore_resumes_after_hard_interruption_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            one, two, created = root / "one", root / "two", root / "created"
+            one.write_bytes(b"old one")
+            two.write_bytes(b"old two")
+            backup = installer.write_with_backup({one: b"new one", two: b"new two", created: b"new"}, root / "backups")
+            # Simulate a process being killed after these two operations.
+            one.write_bytes(b"old one")
+            created.unlink()
+            installer.restore(backup)
+            installer.restore(backup)
+            self.assertEqual(one.read_bytes(), b"old one")
+            self.assertEqual(two.read_bytes(), b"old two")
+            self.assertFalse(created.exists())
+
+    def test_rollback_io_failure_after_deletion_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            created, target = root / "created", root / "target"
+            target.write_bytes(b"old")
+            backup = installer.write_with_backup({created: b"new file", target: b"installed"}, root / "backups")
+            with patch.object(installer.os, "replace", side_effect=OSError("synthetic replace failure")), self.assertRaises(OSError):
+                installer.restore(backup)
+            # Rollback of the deletion also failed: the same backup must still
+            # permit a later safe retry once the underlying I/O error is gone.
+            installer.restore(backup)
+            self.assertFalse(created.exists())
+            self.assertEqual(target.read_bytes(), b"old")
+
+    def test_restore_rollback_preserves_a_concurrent_user_edit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            one, two = root / "one", root / "two"
+            one.write_bytes(b"old one")
+            two.write_bytes(b"old two")
+            backup = installer.write_with_backup({one: b"new one", two: b"new two"}, root / "backups")
+            actual = installer.os.replace
+
+            def user_edit_during_failure(staged, target):
+                if Path(target) == two:
+                    one.write_bytes(b"later user edit")
+                    raise OSError("synthetic I/O failure")
+                return actual(staged, target)
+
+            with patch.object(installer.os, "replace", user_edit_during_failure), self.assertRaises(OSError):
+                installer.restore(backup)
+            self.assertEqual(one.read_bytes(), b"later user edit")
+            self.assertEqual(two.read_bytes(), b"new two")
+            with self.assertRaises(ValueError):
+                installer.restore(backup)
 
     def test_corrupt_backup_refused_and_noop_creates_no_backup(self):
         with tempfile.TemporaryDirectory() as temp:

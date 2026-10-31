@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,7 +28,10 @@ function completionRoutingLog(event) { desktopNotifyBridge.log(event); }
 function routeCodexCompletion(tid, message) { return desktopNotifyBridge.routeCompletion(tid, message); }
 function sendCodexQuestionPopup(tid, title, message) { return desktopNotifyBridge.sendQuestion(tid, title, message); }
 ''' + END
-DISPATCH = "  if (routeCodexCompletion(tid, message)) return true;\n  if (sendCodexQuestionPopup(tid, title, message)) return true;\n"
+OLD_DISPATCH = "  if (routeCodexCompletion(tid, message)) return true;\n  if (sendCodexQuestionPopup(tid, title, message)) return true;\n"
+PRIVACY = "  ({title, message} = desktopNotifyBridge.safeNotification(title, message));\n"
+DISPATCH = OLD_DISPATCH + PRIVACY
+VSCODE_HEADER = "function sendVsCodeNotification(tid, title, message) {\n"
 
 
 def replace_once(text, old, new):
@@ -47,9 +51,14 @@ def patch_extension(text):
 
 def _patch_lf(text):
     if BEGIN in text:
-        if text.count(INTEGRATION) != 1 or text.count(DISPATCH) != 1:
+        if text.count(INTEGRATION) != 1 or text.count(OLD_DISPATCH) != 1:
             raise ValueError("Existing bridge differs; inspect before updating")
-        return text
+        if text.count(DISPATCH) == 1 and text.count(VSCODE_HEADER + PRIVACY) == 1:
+            return text
+        if PRIVACY in text:
+            raise ValueError("Partial privacy patch; inspect before updating")
+        text = replace_once(text, OLD_DISPATCH, DISPATCH)
+        return replace_once(text, VSCODE_HEADER, VSCODE_HEADER + PRIVACY)
     legacy = "// Local Codex notification bridge: preserve terminal routing and use the same\n"
     dispatch_anchor = "  if (!preferOs) return;\n"
     if legacy in text:
@@ -67,7 +76,7 @@ def _patch_lf(text):
             raise ValueError("Unknown notification customization; nothing applied")
         text = replace_once(text, "function sendOsNotification(", INTEGRATION + "function sendOsNotification(")
         text = replace_once(text, dispatch_anchor, dispatch_anchor + DISPATCH)
-    return text
+    return replace_once(text, VSCODE_HEADER, VSCODE_HEADER + PRIVACY)
 
 
 def run(args):
@@ -147,22 +156,72 @@ def write_with_backup(changes, backup_root):
     return backup
 
 
+def _replace_restored_file(path, data):
+    if data is None:
+        path.unlink()
+        return
+    # Stage beside the target so an I/O failure cannot truncate its current
+    # contents. os.replace commits a complete file on the same filesystem.
+    descriptor, filename = tempfile.mkstemp(prefix=".codex-notify-", dir=path.parent)
+    staged = Path(filename)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        if staged.read_bytes() != data:
+            raise OSError(f"Staged restore verification failed: {path}")
+        if path.exists():
+            shutil.copymode(path, staged)
+        os.replace(staged, path)
+    finally:
+        if staged.exists():
+            staged.chmod(0o600)
+            staged.unlink()
+
+
 def restore(backup):
     records = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))["files"]
     originals = {}
+    installed = {}
     for item in records:
         path = Path(item["path"])
-        if not path.is_file() or digest(path.read_bytes()) != item["after_sha256"]:
-            raise ValueError(f"File changed since installation; refusing to overwrite: {path}")
         original = (backup / item["original"]).read_bytes() if item["original"] else None
         if original is not None and digest(original) != item["before_sha256"]:
             raise ValueError("Backup checksum mismatch; nothing restored")
+        current = path.read_bytes() if path.exists() else None
+        # Accept already-restored files after an interrupted restore, while
+        # continuing to reject later edits that match neither known version.
+        if current != original and (current is None or digest(current) != item["after_sha256"]):
+            raise ValueError(f"File changed since installation; refusing to overwrite: {path}")
         originals[path] = original
-    for path, data in originals.items():
-        if data is None:
-            path.unlink()
-        else:
-            path.write_bytes(data)
+        installed[path] = current
+    written = []
+    try:
+        for path, data in originals.items():
+            current = path.read_bytes() if path.exists() else None
+            if current != installed[path]:
+                raise ValueError(f"File changed during restore: {path}")
+            if current == data:
+                continue
+            written.append(path)
+            _replace_restored_file(path, data)
+            if (path.read_bytes() if path.exists() else None) != data:
+                raise OSError(f"Restore verification failed: {path}")
+    except Exception as error:
+        failures = []
+        for path in reversed(written):
+            try:
+                if (path.read_bytes() if path.exists() else None) == installed[path]:
+                    continue
+                current = path.read_bytes() if path.exists() else None
+                if current != originals[path]:
+                    raise OSError(f"File changed after restore; refusing rollback overwrite: {path}")
+                _replace_restored_file(path, installed[path])
+            except OSError:
+                failures.append(str(path))
+        if failures:
+            raise OSError("Restore rollback incomplete; preserve the backup and retry after resolving I/O errors: " +
+                          ", ".join(failures)) from error
+        raise
 
 
 def main():

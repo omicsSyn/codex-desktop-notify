@@ -27,7 +27,8 @@ def main():
     errors = []
     for path in files:
         relative = path.relative_to(ROOT)
-        if path.suffix in RUNTIME_SUFFIXES or path.name.startswith(".env"):
+        if (path.suffix in RUNTIME_SUFFIXES or path.name.startswith(".env") or
+                {"payloads", "completion"}.intersection(relative.parts[:-1])):
             errors.append(f"{relative}: runtime/credential file must not be published")
         text = path.read_text(encoding="utf-8-sig")
         for label, pattern in PATTERNS.items():

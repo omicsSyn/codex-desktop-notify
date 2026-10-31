@@ -11,6 +11,8 @@
     [Parameter(Position = 3)]
     [string]$Payload,
 
+    [string]$PayloadToken,
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RemainingArguments
 )
@@ -39,15 +41,53 @@ function Get-CompletionDirectory {
     return Join-Path (Get-NotificationStateDirectory) 'completion'
 }
 
+function Get-PayloadDirectory {
+    return Join-Path (Get-NotificationStateDirectory) 'payloads'
+}
+
+function Write-PopupPayload([string]$Json) {
+    $directory = Get-PayloadDirectory
+    [void][IO.Directory]::CreateDirectory($directory)
+    $token = [Guid]::NewGuid().ToString()
+    $path = Join-Path $directory ($token + '.json')
+    try {
+        [IO.File]::WriteAllText($path, $Json, (New-Object Text.UTF8Encoding($false)))
+    }
+    catch {
+        try { [IO.File]::Delete($path) } catch { }
+        throw
+    }
+    return $token
+}
+
+function Read-PopupPayload([string]$Token) {
+    if ($Token -notmatch '^[0-9a-f-]{36}$') { throw 'Invalid popup payload token' }
+    $path = Join-Path (Get-PayloadDirectory) ($Token + '.json')
+    try { return [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) }
+    finally { [IO.File]::Delete($path) }
+}
+
+function Remove-CompletionFiles([string]$Token) {
+    if ($Token -notmatch '^[0-9a-f-]{36}$') { return }
+    foreach ($suffix in @('.json', '.json.tmp', '.route.json')) {
+        try { [IO.File]::Delete((Join-Path (Get-CompletionDirectory) ($Token + $suffix))) } catch { }
+    }
+}
+
 function Remove-ExpiredCompletions {
-    $directory = Get-CompletionDirectory
-    if (-not [IO.Directory]::Exists($directory)) { return }
     $cutoff = [DateTime]::UtcNow.AddMinutes(-5)
-    foreach ($file in [IO.Directory]::EnumerateFiles($directory)) {
-        if ([IO.Path]::GetFileName($file) -notmatch '^[0-9a-f-]{36}\.(json|json\.tmp|route\.json)$') { continue }
-        try {
-            if ([IO.File]::GetLastWriteTimeUtc($file) -lt $cutoff) { [IO.File]::Delete($file) }
-        } catch { }
+    $locations = @(
+        @{ directory = (Get-CompletionDirectory); pattern = '^[0-9a-f-]{36}\.(json|json\.tmp|route\.json)$' },
+        @{ directory = (Get-PayloadDirectory); pattern = '^[0-9a-f-]{36}\.json$' }
+    )
+    foreach ($location in $locations) {
+        if (-not [IO.Directory]::Exists($location.directory)) { continue }
+        foreach ($file in [IO.Directory]::EnumerateFiles($location.directory)) {
+            if ([IO.Path]::GetFileName($file) -notmatch $location.pattern) { continue }
+            try {
+                if ([IO.File]::GetLastWriteTimeUtc($file) -lt $cutoff) { [IO.File]::Delete($file) }
+            } catch { }
+        }
     }
 }
 
@@ -73,7 +113,9 @@ function Set-CompletionRoute($Data, $Route) {
 # popup so Codex and Claude Code are never blocked by the UI.
 if ($Mode -ne '__show') {
     Remove-ExpiredCompletions
-    $payloadBase64 = ''
+    $hookInput = ''
+    $payloadToken = ''
+    $completionToken = ''
     switch ($Mode.ToLowerInvariant()) {
         { $_ -in @('codex', 'codex-ask') } {
             $popupSource = 'Codex'
@@ -90,6 +132,7 @@ if ($Mode -ne '__show') {
                                 $completionDirectory = Get-CompletionDirectory
                                 [void][IO.Directory]::CreateDirectory($completionDirectory)
                                 $token = [Guid]::NewGuid().ToString()
+                                $completionToken = $token
                                 $completionData | Add-Member -NotePropertyName completion_token -NotePropertyValue $token -Force
                                 $record = @{
                                     token = $token
@@ -104,11 +147,12 @@ if ($Mode -ne '__show') {
                                 Write-PopupFocusLog 'completion_registered' @{ token = $token; session_id = $completionData.session_id }
                             }
                         }
-                        catch { Write-PopupFocusLog 'completion_register_error' @{ error = $_.Exception.Message } }
+                        catch {
+                            Remove-CompletionFiles $completionToken
+                            $completionToken = ''
+                            Write-PopupFocusLog 'completion_register_error' @{ error = $_.Exception.Message }
+                        }
                     }
-                    $payloadBase64 = [Convert]::ToBase64String(
-                        [Text.Encoding]::UTF8.GetBytes($hookInput)
-                    )
                 }
             }
         }
@@ -122,19 +166,28 @@ if ($Mode -ne '__show') {
         }
     }
 
-    $escapedPath = $PSCommandPath.Replace("'", "''")
-    $command = "& '$escapedPath' '__show' '$popupSource' '$popupKind' '$payloadBase64'"
-    $encodedCommand = [Convert]::ToBase64String(
-        [Text.Encoding]::Unicode.GetBytes($command)
-    )
-
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile',
-        '-STA',
-        '-ExecutionPolicy', 'Bypass',
-        '-WindowStyle', 'Hidden',
-        '-EncodedCommand', $encodedCommand
-    ) | Out-Null
+    try {
+        if ($hookInput) { $payloadToken = Write-PopupPayload $hookInput }
+        $escapedPath = $PSCommandPath.Replace("'", "''")
+        $command = "& '$escapedPath' '__show' '$popupSource' '$popupKind' -PayloadToken '$payloadToken'"
+        $encodedCommand = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes($command)
+        )
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile',
+            '-STA',
+            '-ExecutionPolicy', 'Bypass',
+            '-WindowStyle', 'Hidden',
+            '-EncodedCommand', $encodedCommand
+        ) | Out-Null
+    }
+    catch {
+        if ($payloadToken) {
+            try { [IO.File]::Delete((Join-Path (Get-PayloadDirectory) ($payloadToken + '.json'))) } catch { }
+        }
+        Remove-CompletionFiles $completionToken
+        throw
+    }
     exit 0
 }
 
@@ -198,7 +251,11 @@ public class CornerNotificationForm : Form
 '@
 
 $hookData = $null
-if ($Payload) {
+if ($PayloadToken) {
+    try { $hookData = (Read-PopupPayload $PayloadToken) | ConvertFrom-Json }
+    catch { $hookData = $null }
+}
+elseif ($Payload) {
     try {
         $hookData = [Text.Encoding]::UTF8.GetString(
             [Convert]::FromBase64String($Payload)
@@ -470,8 +527,4 @@ if ($routeTimer) { $routeTimer.Stop(); $routeTimer.Dispose() }
 $timer.Dispose()
 $form.Dispose()
 
-if ($hookData -and [string]$hookData.completion_token -match '^[0-9a-f-]{36}$') {
-    foreach ($suffix in @('.json', '.route.json')) {
-        try { [IO.File]::Delete((Join-Path (Get-CompletionDirectory) ($hookData.completion_token + $suffix))) } catch { }
-    }
-}
+if ($hookData) { Remove-CompletionFiles ([string]$hookData.completion_token) }
