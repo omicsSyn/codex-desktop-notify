@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.env*
+*.jsonl
+*.log
+*.bak
+*.original
+*.vsix
+*.zip
+runtime/
+backups/
+local/
+hooks.example.json
+node_modules/
+.vscode/
+.DS_Store
+Thumbs.db
