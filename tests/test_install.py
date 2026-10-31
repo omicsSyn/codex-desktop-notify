@@ -185,7 +185,9 @@ for (const preferOs of [true, false]) {
             actual = installer.os.replace
 
             def fail_second(staged, target):
-                if Path(target) == two:
+                # Manifests use resolved paths; Windows TEMP may use an 8.3
+                # alias while the actual destination uses the long path.
+                if Path(target).resolve() == two.resolve():
                     raise OSError("synthetic second-file I/O failure")
                 return actual(staged, target)
 
@@ -238,7 +240,7 @@ for (const preferOs of [true, false]) {
             actual = installer.os.replace
 
             def user_edit_during_failure(staged, target):
-                if Path(target) == two:
+                if Path(target).resolve() == two.resolve():
                     one.write_bytes(b"later user edit")
                     raise OSError("synthetic I/O failure")
                 return actual(staged, target)
